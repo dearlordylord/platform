@@ -44,6 +44,7 @@ export class TransientMiddleware extends BaseMiddleware implements Middleware {
   ttlChecker: any
   now = Date.now() / 1000
   dbProvider?: DbAdapter
+  private ttlCriticalSection: Promise<void> = Promise.resolve()
 
   private constructor (
     readonly ctx: MeasureContext,
@@ -74,34 +75,64 @@ export class TransientMiddleware extends BaseMiddleware implements Middleware {
     return new TransientMiddleware(ctx, context, next)
   }
 
+  private async withTtlCriticalSection<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.ttlCriticalSection
+    let release: (() => void) | undefined
+    const current = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const tail = previous.then(() => current)
+    this.ttlCriticalSection = tail
+    await previous
+    try {
+      return await operation()
+    } finally {
+      release?.()
+      if (this.ttlCriticalSection === tail) {
+        this.ttlCriticalSection = Promise.resolve()
+      }
+    }
+  }
+
   checkTTL = reduceCalls(async () => {
-    if (this.dbProvider === undefined) {
+    const dbProvider = this.dbProvider
+    if (dbProvider === undefined) {
       return
     }
     this.now = Date.now() / 1000 // Now in seconds
 
-    const docsToRemove: Ref<Doc>[] = []
+    const docsToRemove = new Map<Ref<Doc>, number>()
     for (const v of this.ttlObjectMap.entries()) {
       if (v[1] < this.now) {
-        docsToRemove.push(v[0])
+        docsToRemove.set(v[0], v[1])
       }
     }
 
-    if (docsToRemove.length > 0) {
-      // Drop the expired entries from the map so they are not reprocessed and
-      // re-broadcast on every tick (and the map cannot grow unbounded).
-      for (const id of docsToRemove) {
-        this.ttlObjectMap.delete(id)
-      }
+    if (docsToRemove.size > 0) {
+      const candidateIds = [...docsToRemove.keys()]
       const f = new TxFactory(core.account.System)
-      const docs = await this.dbProvider.load(this.ctx, DOMAIN_TRANSIENT, docsToRemove)
-      // We need to remove all of this docs
-      await this.dbProvider.clean(this.ctx, DOMAIN_TRANSIENT, docsToRemove)
-
-      await this.context.broadcastEvent?.(
-        this.ctx,
-        docs.map((it) => f.createTxRemoveDoc(it._class, it.space, it._id))
-      )
+      const docs = await dbProvider.load(this.ctx, DOMAIN_TRANSIENT, candidateIds)
+      await this.withTtlCriticalSection(async () => {
+        const now = Date.now() / 1000
+        const confirmedIds = candidateIds.filter((id) => {
+          const selectedExpiry = docsToRemove.get(id)
+          return selectedExpiry !== undefined && selectedExpiry < now && this.ttlObjectMap.get(id) === selectedExpiry
+        })
+        if (confirmedIds.length === 0) {
+          return
+        }
+        const confirmedIdSet = new Set(confirmedIds)
+        for (const id of confirmedIds) {
+          this.ttlObjectMap.delete(id)
+        }
+        await dbProvider.clean(this.ctx, DOMAIN_TRANSIENT, confirmedIds)
+        await this.context.broadcastEvent?.(
+          this.ctx,
+          docs
+            .filter((doc) => confirmedIdSet.has(doc._id))
+            .map((doc) => f.createTxRemoveDoc(doc._class, doc.space, doc._id))
+        )
+      })
     }
   })
 
@@ -113,20 +144,34 @@ export class TransientMiddleware extends BaseMiddleware implements Middleware {
     await super.close()
   }
 
-  tx (ctx: MeasureContext<SessionData>, txes: Tx[]): Promise<TxMiddlewareResult> {
-    for (const tx of txes.filter((it) => TxProcessor.isExtendsCUD(it._class)) as TxCUD<Doc>[]) {
-      const ttl = this.ttlValues.get(tx.objectClass)
-      if (ttl !== undefined && this.context.hierarchy.findDomain(tx.objectClass) === DOMAIN_TRANSIENT) {
-        if (tx._class === core.class.TxRemoveDoc) {
-          // ok we have operation against our TTL object.
-          this.ttlObjectMap.delete(tx.objectId)
-        } else {
-          // ok we have operation against our TTL object.
-          this.ttlObjectMap.set(tx.objectId, this.now + ttl + 1)
-        }
-      }
+  async tx (ctx: MeasureContext<SessionData>, txes: Tx[]): Promise<TxMiddlewareResult> {
+    const ttlTxes = txes
+      .filter((it) => TxProcessor.isExtendsCUD(it._class))
+      .filter((tx) => {
+        const cud = tx as TxCUD<Doc>
+        return (
+          this.ttlValues.has(cud.objectClass) && this.context.hierarchy.findDomain(cud.objectClass) === DOMAIN_TRANSIENT
+        )
+      }) as TxCUD<Doc>[]
+    if (ttlTxes.length === 0) {
+      return await this.provideTx(ctx, txes)
     }
 
-    return this.provideTx(ctx, txes)
+    return await this.withTtlCriticalSection(async () => {
+      for (const tx of ttlTxes) {
+        const ttl = this.ttlValues.get(tx.objectClass)
+        if (ttl !== undefined) {
+          if (tx._class === core.class.TxRemoveDoc) {
+            // ok we have operation against our TTL object.
+            this.ttlObjectMap.delete(tx.objectId)
+          } else {
+            // ok we have operation against our TTL object.
+            this.ttlObjectMap.set(tx.objectId, this.now + ttl + 1)
+          }
+        }
+      }
+
+      return await this.provideTx(ctx, txes)
+    })
   }
 }
