@@ -87,6 +87,7 @@ import {
 } from '@hcengineering/server-core'
 import { generateToken, type Token } from '@hcengineering/server-token'
 import { ClientSession } from './client'
+import { KeyedMutex } from './keyedMutex'
 import { sendResponse } from './utils'
 import { Workspace } from './workspace'
 
@@ -109,6 +110,7 @@ export interface Timeouts {
 
 export class TSessionManager implements SessionManager {
   private readonly statusPromises = new Map<string, Promise<void>>()
+  private readonly sessionReplacementMutex = new KeyedMutex()
   readonly workspaces = new Map<WorkspaceUuid, Workspace>()
   checkInterval: any
 
@@ -781,47 +783,10 @@ export class TSessionManager implements SessionManager {
             return { error: new Error('Workspace not found or not available'), terminate: true }
           }
 
-          const oldSession = sessionId !== undefined ? workspace.sessions?.get(sessionId) : undefined
-          if (oldSession !== undefined) {
-            // Just close old socket for old session id.
-            await this.close(ctx, oldSession.socket, workspace.wsId.uuid)
-          }
-
-          const session = this.createSession(token, workspace.wsId, account)
-
-          session.sessionId = sessionId !== undefined && (sessionId ?? '').trim().length > 0 ? sessionId : generateId()
-          session.sessionInstanceId = generateId()
-          const tickHash = this.tickCounter % ticksPerSecond
-
-          this.sessions.set(ws.id, { session, socket: ws, tickHash })
-          // We need to delete previous session with Id if found.
-          this.tickCounter++
-          workspace.sessions.set(session.sessionId, { session, socket: ws, tickHash })
-
-          const accountUuid = account.account
-          if (accountUuid !== systemAccountUuid && accountUuid !== guestAccount) {
-            await this.usersProducer.send(ctx, workspace.wsId.uuid, [
-              userEvents.login({
-                user: accountUuid,
-                sessions: this.countUserSessions(workspace, accountUuid),
-                socialIds: account.socialIds.map((it) => it._id)
-              })
-            ])
-          }
-
-          // Mark workspace as init completed and we had at least one client.
-          if (!workspace.workspaceInitCompleted) {
-            workspace.workspaceInitCompleted = true
-          }
-
-          if (this.timeMinutes > 0) {
-            void ws
-              .send(ctx, { result: this.createMaintenanceWarning() }, session.binaryMode, session.useCompression)
-              .catch((err) => {
-                ctx.error('failed to send maintenance warning', err)
-              })
-          }
-          return { session, context: workspace.context, workspaceId: workspace.wsId.uuid }
+          const replacementKey = JSON.stringify([workspace.wsId.uuid, sessionId ?? ws.id])
+          return await this.sessionReplacementMutex.runExclusive(replacementKey, async () => {
+            return await this.replaceSession(ctx, ws, token, account, workspace, sessionId)
+          })
         } catch (err: unknown) {
           if (err instanceof PlatformError) {
             ctx.warn('addSession: rejected by account service', {
@@ -835,6 +800,57 @@ export class TSessionManager implements SessionManager {
         }
       })
     )
+  }
+
+  private async replaceSession (
+    ctx: MeasureContext,
+    ws: ConnectionSocket,
+    token: Token,
+    account: LoginInfoWithWorkspaces,
+    workspace: Workspace,
+    sessionId: string | undefined
+  ): Promise<AddSessionResponse> {
+    const oldSession = sessionId !== undefined ? workspace.sessions.get(sessionId) : undefined
+    if (oldSession !== undefined) {
+      // Just close old socket for old session id.
+      await this.close(ctx, oldSession.socket, workspace.wsId.uuid)
+    }
+
+    const session = this.createSession(token, workspace.wsId, account)
+
+    session.sessionId = sessionId !== undefined && sessionId.trim().length > 0 ? sessionId : generateId()
+    session.sessionInstanceId = generateId()
+    const tickHash = this.tickCounter % ticksPerSecond
+
+    this.sessions.set(ws.id, { session, socket: ws, tickHash })
+    // We need to delete previous session with Id if found.
+    this.tickCounter++
+    workspace.sessions.set(session.sessionId, { session, socket: ws, tickHash })
+
+    const accountUuid = account.account
+    if (accountUuid !== systemAccountUuid && accountUuid !== guestAccount) {
+      await this.usersProducer.send(ctx, workspace.wsId.uuid, [
+        userEvents.login({
+          user: accountUuid,
+          sessions: this.countUserSessions(workspace, accountUuid),
+          socialIds: account.socialIds.map((it) => it._id)
+        })
+      ])
+    }
+
+    // Mark workspace as init completed and we had at least one client.
+    if (!workspace.workspaceInitCompleted) {
+      workspace.workspaceInitCompleted = true
+    }
+
+    if (this.timeMinutes > 0) {
+      void ws
+        .send(ctx, { result: this.createMaintenanceWarning() }, session.binaryMode, session.useCompression)
+        .catch((err) => {
+          ctx.error('failed to send maintenance warning', err)
+        })
+    }
+    return { session, context: workspace.context, workspaceId: workspace.wsId.uuid }
   }
 
   private async switchToUpgradeSession (
@@ -1116,45 +1132,47 @@ export class TSessionManager implements SessionManager {
       this.sessions.delete(ws.id)
 
       if (workspace !== undefined) {
-        workspace.sessions.delete(sessionRef.session.sessionId)
+        const currentSession = workspace.sessions.get(sessionRef.session.sessionId)
+        if (currentSession === undefined || currentSession.socket.id === ws.id) {
+          workspace.sessions.delete(sessionRef.session.sessionId)
+          const userUuid = sessionRef.session.getUser()
+          await this.usersProducer.send(ctx, workspaceUuid, [
+            userEvents.logout({
+              user: userUuid,
+              sessions: this.countUserSessions(workspace, userUuid),
+              socialIds: sessionRef.session.getUserSocialIds()
+            })
+          ])
 
-        const userUuid = sessionRef.session.getUser()
-        await this.usersProducer.send(ctx, workspaceUuid, [
-          userEvents.logout({
-            user: userUuid,
-            sessions: this.countUserSessions(workspace, userUuid),
-            socialIds: sessionRef.session.getUserSocialIds()
-          })
-        ])
-
-        if (this.doHandleTick) {
-          workspace.tickHandlers.set(sessionRef.session.sessionId, {
-            ticks: this.timeouts.reconnectTimeout * ticksPerSecond,
-            operation: () => {
-              this.reconnectIds.delete(sessionRef.session.sessionId)
-              const user = sessionRef.session.getUser()
-              if (workspace !== undefined) {
-                const another = Array.from(workspace.sessions.values()).findIndex((p) => p.session.getUser() === user)
-                if (another === -1 && !workspace.maintenance) {
-                  void workspace.with(async (pipeline) => {
-                    await pipeline.closeSession(ctx, sessionRef.session.sessionId)
-                    // await communicationApi.closeSession(sessionRef.session.sessionId)
-                    if (user !== guestAccount && user !== systemAccountUuid) {
-                      await this.trySetStatus(
-                        workspace.context.newChild('status', {}),
-                        pipeline,
-                        sessionRef.session,
-                        false,
-                        workspaceUuid
-                      ).catch(() => {})
-                    }
-                  })
+          if (this.doHandleTick) {
+            workspace.tickHandlers.set(sessionRef.session.sessionId, {
+              ticks: this.timeouts.reconnectTimeout * ticksPerSecond,
+              operation: () => {
+                this.reconnectIds.delete(sessionRef.session.sessionId)
+                const user = sessionRef.session.getUser()
+                if (workspace !== undefined) {
+                  const another = Array.from(workspace.sessions.values()).findIndex((p) => p.session.getUser() === user)
+                  if (another === -1 && !workspace.maintenance) {
+                    void workspace.with(async (pipeline) => {
+                      await pipeline.closeSession(ctx, sessionRef.session.sessionId)
+                      // await communicationApi.closeSession(sessionRef.session.sessionId)
+                      if (user !== guestAccount && user !== systemAccountUuid) {
+                        await this.trySetStatus(
+                          workspace.context.newChild('status', {}),
+                          pipeline,
+                          sessionRef.session,
+                          false,
+                          workspaceUuid
+                        ).catch(() => {})
+                      }
+                    })
+                  }
                 }
               }
-            }
-          })
+            })
+          }
+          this.reconnectIds.add(sessionRef.session.sessionId)
         }
-        this.reconnectIds.add(sessionRef.session.sessionId)
       }
       try {
         sessionRef.socket.close()
