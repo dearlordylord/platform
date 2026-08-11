@@ -14,4 +14,7 @@ export interface Query {
   callbacks: Map<string, Callback>
   refresh: () => Promise<void>
   refreshId: number
+  mutationRevision: number
+  activeMutations: number
+  refreshAfterMutation: boolean
 }

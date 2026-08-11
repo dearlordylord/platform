@@ -11,11 +11,16 @@ import {
 
 export class ResultArray {
   private docs: Map<Ref<Doc>, WithLookup<Doc>>
+  private _revision = 0
 
   private readonly clones = new Map<string, Map<Ref<Doc>, WithLookup<Doc>>>()
 
   get length (): number {
     return this.docs.size
+  }
+
+  get revision (): number {
+    return this._revision
   }
 
   constructor (
@@ -56,6 +61,9 @@ export class ResultArray {
   delete (_id: Ref<Doc>): Doc | undefined {
     const doc = this.docs.get(_id)
     this.docs.delete(_id)
+    if (doc !== undefined) {
+      this._revision++
+    }
     for (const [, v] of this.clones.entries()) {
       v.delete(_id)
     }
@@ -64,6 +72,7 @@ export class ResultArray {
 
   updateDoc (doc: WithLookup<Doc>, mainClone = true): void {
     this.docs.set(doc._id, mainClone ? this.hierarchy.clone(doc) : doc)
+    this._revision++
     for (const [, v] of this.clones.entries()) {
       v.set(doc._id, this.hierarchy.clone(doc))
     }
@@ -71,6 +80,7 @@ export class ResultArray {
 
   push (doc: WithLookup<Doc>): void {
     this.docs.set(doc._id, this.hierarchy.clone(doc))
+    this._revision++
     for (const [, v] of this.clones.entries()) {
       v.set(doc._id, this.hierarchy.clone(doc))
     }
@@ -81,6 +91,7 @@ export class ResultArray {
     const lastElement = Array.from(this.docs)[this.docs.size - 1]
     if (lastElement !== undefined) {
       this.docs.delete(lastElement[0])
+      this._revision++
       for (const [, v] of this.clones.entries()) {
         v.delete(lastElement[0])
       }
@@ -93,6 +104,7 @@ export class ResultArray {
     const docs = Array.from(this.docs.values())
     resultSort(docs, sort, _class, hierarchy, memdb)
     this.docs = new Map(docs.map((it) => [it._id, it]))
+    this._revision++
     for (const [k, v] of this.clones.entries()) {
       this.clones.set(k, new Map(docs.map((it) => [it._id, v.get(it._id) ?? this.hierarchy.clone(it)])))
     }
