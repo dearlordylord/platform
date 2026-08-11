@@ -696,6 +696,9 @@ class Connection implements ClientConnection {
         void event.data
           .arrayBuffer()
           .then((data) => {
+            if (this.closed || this.websocket !== wsocket || socketId !== this.sockets) {
+              return
+            }
             if (this.checkArrayBufferPing(data)) {
               // Support ping/pong
               return
