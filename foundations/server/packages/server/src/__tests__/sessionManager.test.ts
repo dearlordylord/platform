@@ -1351,6 +1351,158 @@ describe('TSessionManager', () => {
       // Should not throw
       await sessionManager.close(mockContext, mockSocket as any, 'ws-1' as WorkspaceUuid)
     })
+
+    it('keeps close bookkeeping when the workspace session map was already cleared', async () => {
+      const workspaceId = 'ws-cleared' as WorkspaceUuid
+      const userId = 'user-cleared' as AccountUuid
+      const sessionId = 'session-cleared'
+      const socket = { id: 'socket-cleared', close: jest.fn() }
+      const sessionReference = {
+        session: {
+          sessionId,
+          getUser: jest.fn().mockReturnValue(userId),
+          getUserSocialIds: jest.fn().mockReturnValue(['social-cleared']),
+          getSocialIds: jest.fn().mockReturnValue([]),
+          requests: new Map(),
+          createTime: Date.now()
+        },
+        socket
+      }
+      const workspace = {
+        wsId: { uuid: workspaceId, url: 'cleared-workspace' },
+        sessions: new Map(),
+        tickHandlers: new Map(),
+        maintenance: false
+      }
+      sessionManager.sessions.set(socket.id, sessionReference as any)
+      sessionManager.workspaces.set(workspaceId, workspace as any)
+
+      await sessionManager.close(mockContext, socket as any, workspaceId)
+
+      expect(mockUsersProducer.send).toHaveBeenCalledTimes(1)
+      expect(sessionManager.reconnectIds.has(sessionId)).toBe(true)
+      expect(socket.close).toHaveBeenCalledTimes(1)
+    })
+
+    it('keeps a replacement mapping when a stale socket closes', async () => {
+      const tickingManager = new TSessionManager(
+        mockContext,
+        defaultTimeouts,
+        {},
+        undefined,
+        'http://localhost:3000',
+        true,
+        true,
+        mockQueue,
+        mockPipelineFactory
+      )
+      clearInterval(tickingManager.checkInterval)
+      const workspaceId = 'ws-replacement' as WorkspaceUuid
+      const userId = 'user-replacement' as AccountUuid
+      const sessionId = 'shared-session'
+      const oldSocket = { id: 'old-socket', close: jest.fn() }
+      const replacementSocket = { id: 'replacement-socket', close: jest.fn() }
+      const makeSession = () => ({
+        sessionId,
+        getUser: jest.fn().mockReturnValue(userId),
+        getSocialIds: jest.fn().mockReturnValue([]),
+        getUserSocialIds: jest.fn().mockReturnValue([]),
+        binaryMode: false,
+        useCompression: false,
+        createTime: Date.now(),
+        requests: new Map()
+      })
+      const oldReference = { session: makeSession(), socket: oldSocket, tickHash: 0 }
+      const replacementReference = { session: makeSession(), socket: replacementSocket, tickHash: 1 }
+      const workspace = {
+        wsId: { uuid: workspaceId, url: 'replacement-workspace' },
+        sessions: new Map([[sessionId, replacementReference]]),
+        tickHandlers: new Map(),
+        maintenance: false
+      }
+
+      tickingManager.sessions.set(oldSocket.id, oldReference as any)
+      tickingManager.sessions.set(replacementSocket.id, replacementReference as any)
+      tickingManager.workspaces.set(workspaceId, workspace as any)
+
+      await tickingManager.close(mockContext, oldSocket as any, workspaceId)
+
+      expect(tickingManager.sessions.has(replacementSocket.id)).toBe(true)
+      expect(workspace.sessions.get(sessionId)).toBe(replacementReference)
+      expect(workspace.tickHandlers.size).toBe(0)
+      expect(tickingManager.reconnectIds.has(sessionId)).toBe(false)
+      expect(mockUsersProducer.send).not.toHaveBeenCalled()
+    })
+
+    it('serializes concurrent reconnects for the same workspace session', async () => {
+      const workspaceId = 'ws-concurrent-reconnect' as WorkspaceUuid
+      const sessionId = 'shared-session'
+      const oldSocket = { id: 'old-socket', close: jest.fn(), data: jest.fn().mockReturnValue({}) }
+      const oldReference = {
+        session: {
+          sessionId,
+          getUser: jest.fn().mockReturnValue(systemAccountUuid),
+          getSocialIds: jest.fn().mockReturnValue([]),
+          getUserSocialIds: jest.fn().mockReturnValue([]),
+          requests: new Map(),
+          createTime: Date.now()
+        },
+        socket: oldSocket,
+        tickHash: 0
+      }
+      const workspace = {
+        wsId: { uuid: workspaceId, url: 'concurrent-reconnect' },
+        sessions: new Map([[sessionId, oldReference]]),
+        tickHandlers: new Map(),
+        maintenance: false,
+        workspaceInitCompleted: true,
+        context: mockContext
+      }
+      sessionManager.sessions.set(oldSocket.id, oldReference as any)
+      sessionManager.workspaces.set(workspaceId, workspace as any)
+      ;(sessionManager.sysAccount.workspaces as any)[workspaceId] = {
+        url: 'concurrent-reconnect',
+        mode: 'active',
+        dataId: 'test-data',
+        version: { versionMajor: 0, versionMinor: 0, versionPatch: 0 },
+        role: AccountRole.Owner,
+        endpoint: { externalUrl: '', internalUrl: '', region: '' }
+      } as any
+      jest.spyOn(sessionManager, 'getWorkspace').mockResolvedValue({ workspace: workspace as any })
+      let releaseLogout: (() => void) | undefined
+      const logoutBarrier = new Promise<void>((resolve) => {
+        releaseLogout = resolve
+      })
+      let logoutStarted: (() => void) | undefined
+      const logoutStartedPromise = new Promise<void>((resolve) => {
+        logoutStarted = resolve
+      })
+      mockUsersProducer.send.mockImplementationOnce(async () => {
+        logoutStarted?.()
+        await logoutBarrier
+      })
+      const makeSocket = (id: string) => ({
+        id,
+        close: jest.fn(),
+        data: jest.fn().mockReturnValue({}),
+        send: jest.fn().mockResolvedValue(undefined)
+      })
+      const firstSocket = makeSocket('first-reconnect')
+      const secondSocket = makeSocket('second-reconnect')
+      const token = { account: systemAccountUuid, workspace: workspaceId, extra: {} } as Token
+
+      const first = sessionManager.addSession(mockContext, firstSocket as any, token, 'token', sessionId)
+      await logoutStartedPromise
+      const second = sessionManager.addSession(mockContext, secondSocket as any, token, 'token', sessionId)
+      await new Promise<void>((resolve) => setTimeout(resolve, 0))
+      releaseLogout?.()
+      await Promise.all([first, second])
+
+      expect(sessionManager.sessions.has(firstSocket.id)).toBe(false)
+      expect(sessionManager.sessions.has(secondSocket.id)).toBe(true)
+      expect(workspace.sessions.get(sessionId)?.socket).toBe(secondSocket)
+      expect(workspace.sessions.size).toBe(1)
+    })
   })
 
   describe('doBroadcast', () => {
